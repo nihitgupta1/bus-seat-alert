@@ -22,7 +22,7 @@ from playwright.sync_api import sync_playwright
 DATES = ["17-Nov-2026", "18-Nov-2026"]
 OPERATOR = "raj ratan"          # matched case-insensitively against the bus card text
 DEPART_BEFORE = (19, 0)         # only buses departing before 19:00
-ALERT_IF_SINGLES_BELOW = 3      # alert when available single seats is LESS than this
+ALERT_IF_SINGLES_BELOW = 3      # alert when available single seats is LESS than this (3 = alert at 2 or fewer)
 COUNT_LADIES_SEATS = False      # pink "ladies only" seats: count them as available?
 SEARCH_URL = (
     "https://www.redbus.in/bus-tickets/indore-to-pune"
@@ -202,7 +202,17 @@ def load_all(page):
 
 
 def open_results(page, url):
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    last_err = None
+    for attempt in range(2):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            break
+        except Exception as e:
+            last_err = e
+            print(f"    page load attempt {attempt + 1} failed: {str(e).splitlines()[0]}")
+            page.wait_for_timeout(3000)
+    else:
+        raise last_err
     page.wait_for_function(COUNT_FN, timeout=45000)
     load_all(page)
 
@@ -332,7 +342,9 @@ def main():
     failures = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True, args=["--disable-blink-features=AutomationControlled"]
+            headless=True,
+            channel="chrome",
+            args=["--disable-blink-features=AutomationControlled", "--disable-http2"],
         )
         ctx = browser.new_context(
             viewport={"width": 1366, "height": 900},

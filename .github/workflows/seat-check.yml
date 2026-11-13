@@ -33,7 +33,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install browser
-        run: python -m playwright install --with-deps chromium
+        run: python -m playwright install --with-deps chrome
 
       - name: Check seats
         env:
