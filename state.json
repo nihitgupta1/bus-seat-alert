@@ -1,1 +1,22 @@
-{}
+{
+  "17-Nov-2026|18:00|Volvo 9600 Multi-Axle A/C Sleeper (2+1)": {
+    "checked": "2026-11-13T17:33+05:30",
+    "low": true,
+    "singles": 0
+  },
+  "17-Nov-2026|18:00|Volvo 9600 SLX Multi-Axle AC Sleeper (2+1)": {
+    "checked": "2026-11-13T17:33+05:30",
+    "low": true,
+    "singles": 0
+  },
+  "18-Nov-2026|18:00|Volvo 9600 Multi-Axle A/C Sleeper (2+1)": {
+    "checked": "2026-11-13T17:33+05:30",
+    "low": true,
+    "singles": 0
+  },
+  "18-Nov-2026|18:00|Volvo 9600 SLX Multi-Axle AC Sleeper (2+1)": {
+    "checked": "2026-11-13T17:33+05:30",
+    "low": true,
+    "singles": 0
+  }
+}
