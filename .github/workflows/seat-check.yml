@@ -1,0 +1,62 @@
+name: Check bus seats
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC clock, same cadence anywhere)
+  workflow_dispatch:
+    inputs:
+      test_notify:
+        description: "Only send a test notification to my phone"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # lets the job commit state.json so alerts aren't repeated
+
+concurrency:
+  group: seat-check
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install browser
+        run: python -m playwright install --with-deps chromium
+
+      - name: Check seats
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DEBUG: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python check_seats.py ${{ inputs.test_notify && '--test-notify' || '' }}
+
+      - name: Save state
+        if: always()
+        run: |
+          if [ -n "$(git status --porcelain state.json)" ]; then
+            git config user.name "seat-bot"
+            git config user.email "seat-bot@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update seat state"
+            git push
+          fi
+
+      - name: Upload debug files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          retention-days: 1
+          if-no-files-found: ignore
