@@ -385,7 +385,7 @@ def main():
     failures = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled", "--disable-http2"],
         )
