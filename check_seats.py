@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 # ------------------------------ CONFIG ------------------------------------
 DATES = ["17-Nov-2026", "18-Nov-2026"]
 OPERATOR = "raj ratan"          # matched case-insensitively against the bus card text
-DEPART_BEFORE = (19, 30)         # only buses departing before 19:30
+DEPART_BEFORE = (19, 30)        # only buses departing before 19:30
 ALERT_IF_SINGLES_BELOW = 3      # alert when available singles is LESS than this (3 = at 2 or fewer)
 MIN_SINGLES_TO_ALERT = 1        # no alert at 0 singles (nothing to book); set 0 to hear about sell-outs
 TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count
@@ -256,7 +256,7 @@ def open_results(browser, date):
                 dump(page, f"load-fail-{date}")
             ctx.close()
             if attempt < 2:
-                time.sleep(10)
+                time.sleep(45)
     raise last_err
 
 
@@ -328,26 +328,23 @@ def analyse(seats):
     return total if found else None
 
 
-def read_singles(browser, date, target):
-    """Open one bus's seat map and count its available single seats (None on failure)."""
-    try:
-        ctx, page = open_results(browser, date)
-    except Exception as e:
-        print(f"    could not reopen results: {str(e).splitlines()[0]}")
+def read_singles(page, target):
+    """Open one bus's seat map on an already-loaded results page and count its available
+    single seats (None on failure)."""
+    card = next(
+        (
+            c for c in page.evaluate(TAG_CARDS_JS)
+            if (ev := evaluate_card(c["text"]))["ok"]
+            and ev["dep"] == target["dep"] and ev["type"] == target["type"]
+        ),
+        None,
+    )
+    if card is None:
+        print("    bus no longer listed")
         return None
+    btn = page.locator(f'[data-sc-btn="{card["i"]}"]').first
+    result = None
     try:
-        card = next(
-            (
-                c for c in page.evaluate(TAG_CARDS_JS)
-                if (ev := evaluate_card(c["text"]))["ok"]
-                and ev["dep"] == target["dep"] and ev["type"] == target["type"]
-            ),
-            None,
-        )
-        if card is None:
-            print("    bus no longer listed on reload")
-            return None
-        btn = page.locator(f'[data-sc-btn="{card["i"]}"]').first
         btn.scroll_into_view_if_needed(timeout=10000)
         btn.click(timeout=10000)
         try:
@@ -359,14 +356,29 @@ def read_singles(browser, date, target):
         print(f"    read {len(seats)} seats")
         result = analyse(seats) if seats else None
         if result is None:
-            dump(page, f"seats-fail-{date}-{target['dep']}")
-        return result
+            dump(page, f"seats-fail-{target['dep']}")
     except Exception as e:
         print(f"    error reading seats: {e}")
-        dump(page, f"seats-error-{date}-{target['dep']}")
-        return None
-    finally:
-        ctx.close()
+        dump(page, f"seats-error-{target['dep']}")
+    try:  # close the seat map again so the next bus starts from a clean page
+        btn.click(timeout=3000)
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
+    return result
+
+
+def clean_page(browser, date, ctx, page):
+    """Make sure no seat map is left open from the previous bus; reload if one is."""
+    if not page.evaluate(SEATS_JS):
+        return ctx, page
+    print("    previous seat map is still open; reloading results")
+    ctx.close()
+    try:
+        return open_results(browser, date)
+    except Exception as e:
+        print(f"    could not reload results: {str(e).splitlines()[0]}")
+        return None, None
 
 
 # ------------------------------ main --------------------------------------
@@ -382,24 +394,28 @@ def main():
         return
 
     state = load_state()
-    failures = 0
+    attempted = succeeded = 0
+    sessions = []  # (date, context, page, targets) for every date that loaded
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled", "--disable-http2"],
         )
-        for date in dates:
+
+        # Step 1: load each date's results ONCE and keep the pages open. redBus starts
+        # showing today's date if it is asked for the same search several times in a row,
+        # so every bus is read from these already-loaded pages instead of reloading.
+        for n, date in enumerate(dates):
+            if n:
+                time.sleep(10)
             try:
                 ctx, page = open_results(browser, date)
             except Exception as e:
                 print(f"[{date}] could not load results: {str(e).splitlines()[0]}")
-                failures += 1
                 continue
             cards = page.evaluate(TAG_CARDS_JS)
-            ctx.close()
             print(f"[{date}] {len(cards)} buses listed")
-
             targets = []
             for c in cards:
                 ev = evaluate_card(c["text"])
@@ -412,16 +428,22 @@ def main():
                     targets.append(ev)
             if not targets:
                 print(f"[{date}] no matching buses right now")
+            sessions.append((date, ctx, page, targets))
 
+        # Step 2: read the seat map of each watched bus and decide on alerts.
+        for date, ctx, page, targets in sessions:
             for target in targets:
                 key = f"{date}|{target['dep']}|{target['type']}"
                 print(f"  checking {key}")
-                singles = read_singles(browser, date, target)
+                attempted += 1
+                if ctx is not None:
+                    ctx, page = clean_page(browser, date, ctx, page)
+                singles = read_singles(page, target) if ctx is not None else None
                 time.sleep(3)
                 if singles is None:
                     print("    could not determine single seats; no alert decision made")
-                    failures += 1
                     continue
+                succeeded += 1
                 alerted = state.get(key, {}).get("alerted", False)
                 eligible = MIN_SINGLES_TO_ALERT <= singles < ALERT_IF_SINGLES_BELOW
                 print(f"    available single seats: {singles}")
@@ -440,9 +462,12 @@ def main():
                     "singles": singles,
                     "checked": datetime.now(IST).isoformat(timespec="minutes"),
                 }
+            if ctx is not None:
+                ctx.close()
         browser.close()
 
-    run_failed = bool(failures) and failures >= len(dates)
+    # A run counts as failed if no date loaded, or buses were found but none could be read.
+    run_failed = not sessions or (attempted > 0 and succeeded == 0)
     streak = state.get("_meta", {}).get("fail_streak", 0)
     streak = streak + 1 if run_failed else 0
     if run_failed and streak == FAIL_ALERT_AFTER:
