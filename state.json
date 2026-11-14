@@ -19,6 +19,11 @@
     "checked": "2026-11-14T22:21+05:30",
     "singles": 4
   },
+  "17-Nov-2026|19:15|Volvo 9600 SLX Multi-Axle AC Sleeper (2+1)": {
+    "alerted": true,
+    "checked": "2026-11-14T22:57+05:30",
+    "singles": 2
+  },
   "18-Nov-2026|18:00|Volvo 9600 Multi-Axle A/C Sleeper (2+1)": {
     "checked": "2026-11-13T17:33+05:30",
     "low": true,
@@ -40,6 +45,6 @@
     "singles": 2
   },
   "_meta": {
-    "fail_streak": 0
+    "fail_streak": 1
   }
 }
