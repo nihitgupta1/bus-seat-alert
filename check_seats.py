@@ -23,7 +23,9 @@ DATES = ["17-Nov-2026", "18-Nov-2026"]
 OPERATOR = "raj ratan"          # matched case-insensitively against the bus card text
 DEPART_BEFORE = (19, 0)         # only buses departing before 19:00
 ALERT_IF_SINGLES_BELOW = 3      # alert when available single seats is LESS than this (3 = alert at 2 or fewer)
-COUNT_LADIES_SEATS = False      # pink "ladies only" seats: count them as available?
+MIN_SINGLES_TO_ALERT = 1        # no alert when 0 singles are left (nothing to book); 0 = tell me about sell-outs too
+TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count as bookable
+FAIL_ALERT_AFTER = 4            # warn on phone after this many failed runs in a row (~2 hours)
 SEARCH_URL = (
     "https://www.redbus.in/bus-tickets/indore-to-pune"
     "?fromCityName=Indore&toCityName=Pune&fromCityId=313&toCityId=130"
@@ -189,32 +191,112 @@ def evaluate_card(text):
 
 def load_all(page):
     """Scroll until the list of buses stops growing."""
-    last = -1
+    last, stable = -1, 0
     page.mouse.move(600, 500)
-    for _ in range(25):
+    for _ in range(40):
         n = page.evaluate(COUNT_JS)
+        if DEBUG:
+            print(f"    scrolling: {n} buses in the page so far")
         if n == last:
-            break
-        last = n
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            stable += 1
+            if stable >= 3:  # list hasn't grown for 3 checks in a row
+                break
+        else:
+            last, stable = n, 0
+        # bring the last bus on screen (triggers lazy loading), then scroll further
+        page.evaluate(
+            r"""() => {
+              const b = [...document.querySelectorAll('*')].filter(e => e.children.length === 0
+                && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || ''));
+              if (b.length) b[b.length - 1].scrollIntoView({block: 'end'});
+              window.scrollTo(0, document.body.scrollHeight);
+            }"""
+        )
         page.mouse.wheel(0, 5000)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
 
 
-def open_results(page, url):
+def make_context(browser):
+    """A brand-new browser profile (no cookies or storage carried over from earlier pages)."""
+    return browser.new_context(
+        viewport={"width": 1366, "height": 900},
+        locale="en-IN",
+        timezone_id="Asia/Kolkata",
+        user_agent=UA,
+    )
+
+
+def open_results(browser, url, date):
+    """Open the results page for `date` in a fresh profile; retry up to 3 times.
+
+    Returns (context, page); the caller must close the context. Raises if the page
+    never loads or keeps showing a different date than requested.
+    """
     last_err = None
-    for attempt in range(2):
+    for attempt in range(3):
+        ctx = make_context(browser)
+        page = ctx.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            break
+            page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_function(COUNT_FN, timeout=30000)
+            shown = re.search(r"onward=([^&]+)", page.url)
+            if shown and shown.group(1).lower() != date.lower():
+                raise RuntimeError(
+                    f"redBus is showing date {shown.group(1)} instead of {date}"
+                )
+            if not shown:
+                print("    warning: could not read the date from the page URL")
+            load_all(page)
+            return ctx, page
         except Exception as e:
             last_err = e
-            print(f"    page load attempt {attempt + 1} failed: {str(e).splitlines()[0]}")
-            page.wait_for_timeout(3000)
-    else:
-        raise last_err
-    page.wait_for_function(COUNT_FN, timeout=45000)
-    load_all(page)
+            print(f"    page load attempt {attempt + 1}/3 failed: {str(e).splitlines()[0]}")
+            if attempt == 2:
+                describe_page(page)
+                dump(page, f"load-fail-{date}", force=True)
+            ctx.close()
+            if attempt < 2:
+                time.sleep(10)
+    raise last_err
+
+
+def describe_page(page):
+    """Print what the browser is actually looking at (for diagnosing load failures)."""
+    try:
+        print(f"    final URL: {page.url}")
+        print(f"    title: {page.title()!r}")
+        body = page.evaluate(
+            r"() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 600)"
+        )
+        print(f"    page text starts: {body!r}")
+        btns = page.evaluate(
+            r"""() => [...new Set([...document.querySelectorAll(
+                'button, a[role=button], [role=button]')]
+                .map(e => (e.innerText || '').trim())
+                .filter(t => t && t.length < 30))].slice(0, 25)"""
+        )
+        print(f"    button texts: {btns}")
+    except Exception as e:
+        print(f"    (could not describe page: {e})")
+
+
+def report_listing(page, found):
+    """Debug: compare the bus count the page announces with the cards we found."""
+    try:
+        txt = page.evaluate("() => document.body.innerText || ''")
+        m = re.search(r"(\d+)\s+buses", txt, re.I)
+        says = m.group(0) if m else "no bus count found in page text"
+        print(f"    page says: {says!r}; 'View seats' buttons found: {found}")
+        print(f"    page URL: {page.url}")
+        print(f"    page text starts: {' '.join(txt.split())[:300]!r}")
+        btns = page.evaluate(
+            r"""() => [...new Set([...document.querySelectorAll('button, [role=button], a')]
+                .map(e => (e.innerText || '').trim())
+                .filter(t => /more|show|load|next|page/i.test(t) && t.length < 40))].slice(0, 15)"""
+        )
+        print(f"    buttons/links mentioning more/show/load/next/page: {btns}")
+    except Exception as e:
+        print(f"    (could not report listing: {e})")
 
 
 def classify(seat):
@@ -234,8 +316,12 @@ def classify(seat):
 
 
 def available_states():
+    # green = free for anyone, blue = free but men only, pink = free but ladies only.
+    # A seat showing a price (not "Sold") is free; its border colour says who may book it.
     states = {"green", "other"}
-    if COUNT_LADIES_SEATS:
+    if TRAVELLER in ("male", "any"):
+        states.add("blue")
+    if TRAVELLER in ("female", "any"):
         states.add("pink")
     return states
 
@@ -268,6 +354,13 @@ def analyse(seats):
     for s in seats:
         s["state"] = classify(s)
         decks.setdefault(s["deck"], []).append(s)
+    if DEBUG:
+        print("    seat table (deck, x, y, text, border colour, state):")
+        for s in sorted(seats, key=lambda s: (s["deck"], round(s["x"]), round(s["y"]))):
+            print(
+                f"      {s['deck']:<11} x={s['x']:.0f} y={s['y']:.0f} "
+                f"{s['text']:<8} colour={s['color']} -> {s['state']}"
+            )
     total, found = 0, False
     for deck, ds in sorted(decks.items()):
         sx = single_column(ds)
@@ -286,10 +379,13 @@ def analyse(seats):
     return total if found else None
 
 
-def read_singles(ctx, url, date, target):
-    page = ctx.new_page()
+def read_singles(browser, url, date, target):
     try:
-        open_results(page, url)
+        ctx, page = open_results(browser, url, date)
+    except Exception as e:
+        print(f"    could not reopen results: {str(e).splitlines()[0]}")
+        return None
+    try:
         cards = page.evaluate(TAG_CARDS_JS)
         match = None
         for c in cards:
@@ -323,7 +419,7 @@ def read_singles(ctx, url, date, target):
         dump(page, f"error-{date}-{target['dep']}", force=True)
         return None
     finally:
-        page.close()
+        ctx.close()
 
 
 # ------------------------------ main --------------------------------------
@@ -346,26 +442,19 @@ def main():
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled", "--disable-http2"],
         )
-        ctx = browser.new_context(
-            viewport={"width": 1366, "height": 900},
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-            user_agent=UA,
-        )
         for date in dates:
             url = SEARCH_URL.format(date=date)
-            page = ctx.new_page()
             try:
-                open_results(page, url)
+                ctx, page = open_results(browser, url, date)
             except Exception as e:
-                print(f"[{date}] could not load results: {e}")
-                dump(page, f"load-fail-{date}", force=True)
+                print(f"[{date}] could not load results: {str(e).splitlines()[0]}")
                 failures += 1
-                page.close()
                 continue
             cards = page.evaluate(TAG_CARDS_JS)
+            if DEBUG:
+                report_listing(page, len(cards))
             dump(page, f"results-{date}")
-            page.close()
+            ctx.close()
             print(f"[{date}] {len(cards)} buses listed")
 
             targets = []
@@ -374,6 +463,8 @@ def main():
                 if OPERATOR in c["text"].lower():
                     verdict = "WATCH" if ev["ok"] else f"skip ({ev['why']})"
                     print(f"  {verdict}: dep={ev['dep']} type={ev['type']!r}")
+                    if DEBUG:
+                        print(f"      card text: {c['text'].replace(chr(10), ' | ')[:350]!r}")
                 if ev["ok"] and not any(
                     t["dep"] == ev["dep"] and t["type"] == ev["type"] for t in targets
                 ):
@@ -384,31 +475,48 @@ def main():
             for target in targets:
                 key = f"{date}|{target['dep']}|{target['type']}"
                 print(f"  checking {key}")
-                singles = read_singles(ctx, url, date, target)
+                singles = read_singles(browser, url, date, target)
                 time.sleep(3)
                 if singles is None:
                     print("    could not determine single seats; no alert decision made")
                     failures += 1
                     continue
-                prev = state.get(key, {})
-                low = singles < ALERT_IF_SINGLES_BELOW
-                print(f"    available single seats: {singles} (alert threshold: below {ALERT_IF_SINGLES_BELOW})")
-                if low and not prev.get("low"):
-                    notify(
+                alerted = state.get(key, {}).get("alerted", False)
+                eligible = MIN_SINGLES_TO_ALERT <= singles < ALERT_IF_SINGLES_BELOW
+                print(
+                    f"    available single seats: {singles} "
+                    f"(alert when {MIN_SINGLES_TO_ALERT} to {ALERT_IF_SINGLES_BELOW - 1})"
+                )
+                if eligible and not alerted:
+                    if notify(
                         "Single seats running low",
                         f"{date} {target['dep']} {target['type']}: "
                         f"{singles} single seat{'s' if singles != 1 else ''} left.",
                         click=url,
-                    )
+                    ):
+                        alerted = True
+                elif singles >= ALERT_IF_SINGLES_BELOW:
+                    alerted = False  # plenty of seats again; re-arm the alert
                 state[key] = {
-                    "low": low,
+                    "alerted": alerted,
                     "singles": singles,
                     "checked": datetime.now(IST).isoformat(timespec="minutes"),
                 }
         browser.close()
 
+    run_failed = bool(failures) and failures >= len(dates)
+    streak = state.get("_meta", {}).get("fail_streak", 0)
+    streak = streak + 1 if run_failed else 0
+    if run_failed and streak == FAIL_ALERT_AFTER:
+        notify(
+            "Seat checker is failing",
+            f"{streak} runs in a row failed (about {streak * 30} min). "
+            "You are not being watched until it recovers. Check the Actions tab.",
+            priority="default",
+        )
+    state["_meta"] = {"fail_streak": streak}
     save_state(state)
-    if failures and failures >= len(dates):
+    if run_failed:
         sys.exit(1)
 
 
