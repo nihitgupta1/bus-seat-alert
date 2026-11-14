@@ -27,15 +27,10 @@ MIN_SINGLES_TO_ALERT = 1        # no alert at 0 singles (nothing to book); set 0
 TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count
 FAIL_ALERT_AFTER = 4            # warn on phone after this many failed runs in a row (~2 hours)
 
-# redBus sometimes swaps the date in the URL for today's date, so the same search is
-# written three ways. Each attempt uses the next form; the one that works is tried first.
-_BASE = "https://www.redbus.in/bus-tickets/indore-to-pune"
-URL_FORMS = [
-    _BASE + "?fromCityId=313&fromCityName=Indore&toCityId=130&toCityName=Pune&onward={date}&ref=search",
-    _BASE + "?fromCityName=Indore&toCityName=Pune&fromCityId=313&toCityId=130&onward={date}&ref=modifyDate",
-    _BASE + "?fromCityId=313&fromCityName=Indore&toCityId=130&toCityName=Pune&onward={date}",
-]
-_url_order = [0, 1, 2]
+SEARCH_URL = (
+    "https://www.redbus.in/bus-tickets/indore-to-pune"
+    "?fromCityId=313&fromCityName=Indore&toCityId=130&toCityName=Pune&onward={date}&ref=search"
+)
 # --------------------------------------------------------------------------
 
 STATE_FILE = Path("state.json")
@@ -50,7 +45,7 @@ UA = (
 # ------------------------------ page scripts ------------------------------
 # Every "View seats" button on the page (one per bus).
 _BUTTONS = r"""[...document.querySelectorAll('*')].filter(
-  e => e.children.length === 0 && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || ''))"""
+  e => e.children.length === 0 && /^\s*(view seats?|hide seats?|select seats?)\s*$/i.test(e.textContent || ''))"""
 
 COUNT_JS = "() => " + _BUTTONS + ".length"
 
@@ -222,15 +217,19 @@ def load_all(page):
         page.wait_for_timeout(1500)
 
 
+class DateMismatch(Exception):
+    """redBus is showing a different date (usually today's) than the one requested."""
+
+
 def open_results(browser, date):
     """Open the results page for `date` in a fresh browser profile and load every bus.
 
-    Up to 3 attempts, each with a different URL form. Fails if redBus keeps showing a
-    different date than the one requested. Returns (context, page); caller closes context.
+    Retries once after a network problem or timeout. If redBus shows a different date than
+    the one requested it gives up straight away: retrying doesn't help and only adds more
+    searches. Returns (context, page); the caller closes the context.
     """
     last_err = None
-    for attempt in range(3):
-        idx = _url_order[attempt]
+    for attempt in range(2):
         ctx = browser.new_context(
             viewport={"width": 1366, "height": 900},
             locale="en-IN",
@@ -239,24 +238,22 @@ def open_results(browser, date):
         )
         page = ctx.new_page()
         try:
-            page.goto(URL_FORMS[idx].format(date=date), wait_until="domcontentloaded", timeout=40000)
-            page.wait_for_function(f"({COUNT_JS})() > 0", timeout=30000)
+            page.goto(SEARCH_URL.format(date=date), wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_function(f"({COUNT_JS})() > 0", timeout=50000)
             shown = re.search(r"onward=([^&]+)", page.url)
             if shown and shown.group(1).lower() != date.lower():
-                raise RuntimeError(f"redBus is showing date {shown.group(1)} instead of {date}")
+                raise DateMismatch(f"redBus is showing date {shown.group(1)} instead of {date}")
             load_all(page)
-            if idx != _url_order[0]:
-                _url_order.remove(idx)
-                _url_order.insert(0, idx)
             return ctx, page
         except Exception as e:
             last_err = e
-            print(f"    attempt {attempt + 1}/3 (URL form #{idx + 1}) failed: {str(e).splitlines()[0]}")
-            if attempt == 2:
+            print(f"    attempt {attempt + 1}/2 failed: {str(e).splitlines()[0]}")
+            if isinstance(e, DateMismatch) or attempt == 1:
                 dump(page, f"load-fail-{date}")
+                ctx.close()
+                break
             ctx.close()
-            if attempt < 2:
-                time.sleep(45)
+            time.sleep(20)
     raise last_err
 
 
@@ -328,10 +325,9 @@ def analyse(seats):
     return total if found else None
 
 
-def read_singles(page, target):
-    """Open one bus's seat map on an already-loaded results page and count its available
-    single seats (None on failure)."""
-    card = next(
+def find_card(page, target):
+    """The bus card (index + text) on the page matching `target`, or None."""
+    return next(
         (
             c for c in page.evaluate(TAG_CARDS_JS)
             if (ev := evaluate_card(c["text"]))["ok"]
@@ -339,6 +335,31 @@ def read_singles(page, target):
         ),
         None,
     )
+
+
+def collapse(page, target, btn):
+    """Close the open seat map. True once no seats are left on the page."""
+    for retag in (False, True):
+        try:
+            if retag:  # the button was re-drawn when the map opened: find the card again
+                card = find_card(page, target)
+                if card is None:
+                    return False
+                btn = page.locator(f'[data-sc-btn="{card["i"]}"]').first
+            btn.click(timeout=3000)
+        except Exception:
+            continue
+        for _ in range(10):  # the map can take a few seconds to disappear
+            page.wait_for_timeout(500)
+            if not page.evaluate(SEATS_JS):
+                return True
+    return False
+
+
+def read_singles(page, target):
+    """Open one bus's seat map on an already-loaded results page and count its available
+    single seats (None on failure)."""
+    card = find_card(page, target)
     if card is None:
         print("    bus no longer listed")
         return None
@@ -360,11 +381,8 @@ def read_singles(page, target):
     except Exception as e:
         print(f"    error reading seats: {e}")
         dump(page, f"seats-error-{target['dep']}")
-    try:  # close the seat map again so the next bus starts from a clean page
-        btn.click(timeout=3000)
-        page.wait_for_timeout(1000)
-    except Exception:
-        pass
+    if not collapse(page, target, btn):
+        print("    could not close the seat map")
     return result
 
 
@@ -411,6 +429,10 @@ def main():
                 time.sleep(10)
             try:
                 ctx, page = open_results(browser, date)
+            except DateMismatch as e:
+                print(f"[{date}] {e}")
+                print("  redBus is ignoring the requested date; backing off until the next run")
+                break
             except Exception as e:
                 print(f"[{date}] could not load results: {str(e).splitlines()[0]}")
                 continue
@@ -452,7 +474,7 @@ def main():
                         "Single seats running low",
                         f"{date} {target['dep']} {target['type']}: "
                         f"{singles} single seat{'s' if singles != 1 else ''} left.",
-                        click=URL_FORMS[0].format(date=date),
+                        click=SEARCH_URL.format(date=date),
                     ):
                         alerted = True
                 elif singles >= ALERT_IF_SINGLES_BELOW:
