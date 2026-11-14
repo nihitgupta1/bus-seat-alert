@@ -21,21 +21,25 @@ from playwright.sync_api import sync_playwright
 # ------------------------------ CONFIG ------------------------------------
 DATES = ["17-Nov-2026", "18-Nov-2026"]
 OPERATOR = "raj ratan"          # matched case-insensitively against the bus card text
-DEPART_BEFORE = (19, 0)         # only buses departing before 19:00
-ALERT_IF_SINGLES_BELOW = 3      # alert when available single seats is LESS than this (3 = alert at 2 or fewer)
-MIN_SINGLES_TO_ALERT = 1        # no alert when 0 singles are left (nothing to book); 0 = tell me about sell-outs too
-TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count as bookable
+DEPART_BEFORE = (19, 30)         # only buses departing before 19:30
+ALERT_IF_SINGLES_BELOW = 3      # alert when available singles is LESS than this (3 = at 2 or fewer)
+MIN_SINGLES_TO_ALERT = 1        # no alert at 0 singles (nothing to book); set 0 to hear about sell-outs
+TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count
 FAIL_ALERT_AFTER = 4            # warn on phone after this many failed runs in a row (~2 hours)
-SEARCH_URL = (
-    "https://www.redbus.in/bus-tickets/indore-to-pune"
-    "?fromCityName=Indore&toCityName=Pune&fromCityId=313&toCityId=130"
-    "&onward={date}&ref=modifyDate"
-)
+
+# redBus sometimes swaps the date in the URL for today's date, so the same search is
+# written three ways. Each attempt uses the next form; the one that works is tried first.
+_BASE = "https://www.redbus.in/bus-tickets/indore-to-pune"
+URL_FORMS = [
+    _BASE + "?fromCityId=313&fromCityName=Indore&toCityId=130&toCityName=Pune&onward={date}&ref=search",
+    _BASE + "?fromCityName=Indore&toCityName=Pune&fromCityId=313&toCityId=130&onward={date}&ref=modifyDate",
+    _BASE + "?fromCityId=313&fromCityName=Indore&toCityId=130&toCityName=Pune&onward={date}",
+]
+_url_order = [0, 1, 2]
 # --------------------------------------------------------------------------
 
 STATE_FILE = Path("state.json")
 DEBUG_DIR = Path("debug")
-DEBUG = os.environ.get("DEBUG") == "1"
 COL_TOL = 12  # px tolerance when grouping seats into columns
 IST = timezone(timedelta(hours=5, minutes=30))
 UA = (
@@ -44,33 +48,44 @@ UA = (
 )
 
 # ------------------------------ page scripts ------------------------------
-COUNT_FN = r"""() => [...document.querySelectorAll('*')].filter(
-  e => e.children.length === 0 && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || '')
-).length > 0"""
+# Every "View seats" button on the page (one per bus).
+_BUTTONS = r"""[...document.querySelectorAll('*')].filter(
+  e => e.children.length === 0 && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || ''))"""
 
-COUNT_JS = r"""() => [...document.querySelectorAll('*')].filter(
-  e => e.children.length === 0 && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || '')
-).length"""
+COUNT_JS = "() => " + _BUTTONS + ".length"
 
-# Tags every "View seats" button and returns the text of its bus card.
-TAG_CARDS_JS = r"""() => {
-  const re = /^\s*(view seats?|select seats?)\s*$/i;
-  const leaves = [...document.querySelectorAll('*')].filter(
-    e => e.children.length === 0 && re.test(e.textContent || ''));
+# How many buses the page says it has (e.g. "25 buses"); 0 if not found.
+EXPECTED_JS = r"""() => {
+  const m = (document.body.innerText || '').match(/(\d+)\s+buses/i);
+  return m ? parseInt(m[1], 10) : 0;
+}"""
+
+# Centres the last bus card on screen and returns where it is.
+SCROLL_STEP_JS = """() => {
+  const leaves = BUTTONS;
+  if (!leaves.length) { window.scrollBy(0, window.innerHeight * 0.9); return null; }
+  const last = leaves[leaves.length - 1];
+  last.scrollIntoView({block: 'center'});
+  const r = last.getBoundingClientRect();
+  return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+}""".replace("BUTTONS", _BUTTONS)
+
+# Tags each "View seats" button and returns the text of its bus card.
+TAG_CARDS_JS = """() => {
+  const leaves = BUTTONS;
   return leaves.map((leaf, i) => {
     let card = leaf;
     while (card.parentElement) {
       const p = card.parentElement;
-      const n = leaves.filter(l => p.contains(l)).length;
-      if (n > 1) break;
+      if (leaves.filter(l => p.contains(l)).length > 1) break;
       card = p;
     }
     leaf.setAttribute('data-sc-btn', String(i));
     return {i, text: card.innerText || ''};
   });
-}"""
+}""".replace("BUTTONS", _BUTTONS)
 
-# Reads every seat on the open seat layout: position, state text, border colour, deck.
+# Reads every seat on the open seat layout: position, "Sold"/price text, border colour, deck.
 SEATS_JS = r"""() => {
   const seatRe = /^\s*(Sold|₹\s?[\d,]+(\.\d+)?)\s*$/i;
   const all = [...document.querySelectorAll('*')];
@@ -108,7 +123,6 @@ SEATS_JS = r"""() => {
     }
     return {
       x: r.left + window.scrollX, y: r.top + window.scrollY,
-      w: r.width, h: r.height,
       text: (e.innerText || '').trim(), color: borderColor(e), deck: deck,
     };
   });
@@ -116,17 +130,15 @@ SEATS_JS = r"""() => {
 
 
 # ------------------------------ helpers -----------------------------------
-def dump(page, name, force=False):
-    """Save a screenshot + HTML for debugging (always on failure, else only if DEBUG)."""
-    if not (DEBUG or force):
-        return
+def dump(page, name):
+    """Save a screenshot and the page HTML to debug/ (uploaded by the workflow)."""
     try:
         DEBUG_DIR.mkdir(exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
-        page.screenshot(path=str(DEBUG_DIR / f"{safe}.png"), full_page=False)
+        page.screenshot(path=str(DEBUG_DIR / f"{safe}.png"))
         (DEBUG_DIR / f"{safe}.html").write_text(page.content(), encoding="utf-8")
-    except Exception as e:  # never let debugging break the run
-        print(f"  (could not save debug files: {e})")
+    except Exception as e:
+        print(f"    (could not save debug files: {e})")
 
 
 def notify(title, message, click=None, priority="high"):
@@ -156,10 +168,6 @@ def load_state():
         return {}
 
 
-def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
-
-
 def evaluate_card(text):
     """Decide whether a bus card is one we want. Returns a dict."""
     t = text.replace("\u00a0", " ")
@@ -173,139 +181,92 @@ def evaluate_card(text):
     res = {"ok": False, "why": "", "dep": dep, "type": btype}
     if OPERATOR not in low:
         res["why"] = "other operator"
-        return res
-    if dep is None:
+    elif dep is None:
         res["why"] = "no departure time found"
-        return res
-    if (int(dep[:2]), int(dep[3:])) >= DEPART_BEFORE:
+    elif (int(dep[:2]), int(dep[3:])) >= DEPART_BEFORE:
         res["why"] = f"departs {dep}, not before {DEPART_BEFORE[0]:02d}:{DEPART_BEFORE[1]:02d}"
-        return res
-    non_ac = re.search(r"non[\s\-]*a/?c", low)
-    bharat_ac_sleeper = "bharat" in low and "benz" in low and "sleeper" in low and not non_ac
-    if not ("volvo" in low or bharat_ac_sleeper):
-        res["why"] = f"bus type not matched ({btype})"
-        return res
-    res["ok"] = True
+    else:
+        bharat_ac_sleeper = (
+            "bharat" in low and "benz" in low and "sleeper" in low
+            and not re.search(r"non[\s\-]*a/?c", low)
+        )
+        if "volvo" in low or bharat_ac_sleeper:
+            res["ok"] = True
+        else:
+            res["why"] = f"bus type not matched ({btype})"
     return res
 
 
 def load_all(page):
-    """Scroll until the list of buses stops growing."""
+    """Scroll like a person until every bus the page announces is loaded."""
     last, stable = -1, 0
-    page.mouse.move(600, 500)
-    for _ in range(40):
+    for _ in range(60):
         n = page.evaluate(COUNT_JS)
-        if DEBUG:
-            print(f"    scrolling: {n} buses in the page so far")
+        expected = page.evaluate(EXPECTED_JS)
+        if expected and n >= expected:
+            break
         if n == last:
             stable += 1
-            if stable >= 3:  # list hasn't grown for 3 checks in a row
+            if stable >= 4:  # nothing new after 4 scroll rounds in a row
                 break
         else:
             last, stable = n, 0
-        # bring the last bus on screen (triggers lazy loading), then scroll further
-        page.evaluate(
-            r"""() => {
-              const b = [...document.querySelectorAll('*')].filter(e => e.children.length === 0
-                && /^\s*(view seats?|select seats?)\s*$/i.test(e.textContent || ''));
-              if (b.length) b[b.length - 1].scrollIntoView({block: 'end'});
-              window.scrollTo(0, document.body.scrollHeight);
-            }"""
-        )
-        page.mouse.wheel(0, 5000)
-        page.wait_for_timeout(2000)
+        # Centre the last bus, hover over it, then scroll in small wheel steps. This is
+        # what triggers the page's "load more as you scroll" logic.
+        pos = page.evaluate(SCROLL_STEP_JS)
+        if pos:
+            page.mouse.move(pos["x"], pos["y"])
+        for _ in range(4):
+            page.mouse.wheel(0, 500)
+            page.wait_for_timeout(400)
+        page.wait_for_timeout(1500)
 
 
-def make_context(browser):
-    """A brand-new browser profile (no cookies or storage carried over from earlier pages)."""
-    return browser.new_context(
-        viewport={"width": 1366, "height": 900},
-        locale="en-IN",
-        timezone_id="Asia/Kolkata",
-        user_agent=UA,
-    )
+def open_results(browser, date):
+    """Open the results page for `date` in a fresh browser profile and load every bus.
 
-
-def open_results(browser, url, date):
-    """Open the results page for `date` in a fresh profile; retry up to 3 times.
-
-    Returns (context, page); the caller must close the context. Raises if the page
-    never loads or keeps showing a different date than requested.
+    Up to 3 attempts, each with a different URL form. Fails if redBus keeps showing a
+    different date than the one requested. Returns (context, page); caller closes context.
     """
     last_err = None
     for attempt in range(3):
-        ctx = make_context(browser)
+        idx = _url_order[attempt]
+        ctx = browser.new_context(
+            viewport={"width": 1366, "height": 900},
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+            user_agent=UA,
+        )
         page = ctx.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=40000)
-            page.wait_for_function(COUNT_FN, timeout=30000)
+            page.goto(URL_FORMS[idx].format(date=date), wait_until="domcontentloaded", timeout=40000)
+            page.wait_for_function(f"({COUNT_JS})() > 0", timeout=30000)
             shown = re.search(r"onward=([^&]+)", page.url)
             if shown and shown.group(1).lower() != date.lower():
-                raise RuntimeError(
-                    f"redBus is showing date {shown.group(1)} instead of {date}"
-                )
-            if not shown:
-                print("    warning: could not read the date from the page URL")
+                raise RuntimeError(f"redBus is showing date {shown.group(1)} instead of {date}")
             load_all(page)
+            if idx != _url_order[0]:
+                _url_order.remove(idx)
+                _url_order.insert(0, idx)
             return ctx, page
         except Exception as e:
             last_err = e
-            print(f"    page load attempt {attempt + 1}/3 failed: {str(e).splitlines()[0]}")
+            print(f"    attempt {attempt + 1}/3 (URL form #{idx + 1}) failed: {str(e).splitlines()[0]}")
             if attempt == 2:
-                describe_page(page)
-                dump(page, f"load-fail-{date}", force=True)
+                dump(page, f"load-fail-{date}")
             ctx.close()
             if attempt < 2:
                 time.sleep(10)
     raise last_err
 
 
-def describe_page(page):
-    """Print what the browser is actually looking at (for diagnosing load failures)."""
-    try:
-        print(f"    final URL: {page.url}")
-        print(f"    title: {page.title()!r}")
-        body = page.evaluate(
-            r"() => (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 600)"
-        )
-        print(f"    page text starts: {body!r}")
-        btns = page.evaluate(
-            r"""() => [...new Set([...document.querySelectorAll(
-                'button, a[role=button], [role=button]')]
-                .map(e => (e.innerText || '').trim())
-                .filter(t => t && t.length < 30))].slice(0, 25)"""
-        )
-        print(f"    button texts: {btns}")
-    except Exception as e:
-        print(f"    (could not describe page: {e})")
-
-
-def report_listing(page, found):
-    """Debug: compare the bus count the page announces with the cards we found."""
-    try:
-        txt = page.evaluate("() => document.body.innerText || ''")
-        m = re.search(r"(\d+)\s+buses", txt, re.I)
-        says = m.group(0) if m else "no bus count found in page text"
-        print(f"    page says: {says!r}; 'View seats' buttons found: {found}")
-        print(f"    page URL: {page.url}")
-        print(f"    page text starts: {' '.join(txt.split())[:300]!r}")
-        btns = page.evaluate(
-            r"""() => [...new Set([...document.querySelectorAll('button, [role=button], a')]
-                .map(e => (e.innerText || '').trim())
-                .filter(t => /more|show|load|next|page/i.test(t) && t.length < 40))].slice(0, 15)"""
-        )
-        print(f"    buttons/links mentioning more/show/load/next/page: {btns}")
-    except Exception as e:
-        print(f"    (could not report listing: {e})")
-
-
 def classify(seat):
+    """sold / green (free for anyone) / pink (ladies only) / blue (men only) / other."""
     if "sold" in seat["text"].lower():
         return "sold"
-    col = seat.get("color")
-    if not col:
+    if not seat.get("color"):
         return "other"
-    r, g, b = col
+    r, g, b = seat["color"]
     if g > r + 25 and g > b + 25:
         return "green"
     if r > g + 60 and b > g + 20:
@@ -316,7 +277,6 @@ def classify(seat):
 
 
 def available_states():
-    # green = free for anyone, blue = free but men only, pink = free but ladies only.
     # A seat showing a price (not "Sold") is free; its border colour says who may book it.
     states = {"green", "other"}
     if TRAVELLER in ("male", "any"):
@@ -328,7 +288,6 @@ def available_states():
 
 def single_column(deck_seats):
     """x position of the 1-seat column in a 2+1 deck, else None."""
-    centers = []
     cols = []
     for x in sorted(s["x"] for s in deck_seats):
         if cols and abs(x - sum(cols[-1]) / len(cols[-1])) < COL_TOL:
@@ -339,7 +298,7 @@ def single_column(deck_seats):
     if len(centers) < 3:
         return None
     gaps = [centers[i + 1] - centers[i] for i in range(len(centers) - 1)]
-    k = gaps.index(max(gaps))
+    k = gaps.index(max(gaps))  # the aisle is the widest gap
     left, right = centers[: k + 1], centers[k + 1 :]
     if len(left) == 1 and len(right) == 2:
         return left[0]
@@ -354,49 +313,41 @@ def analyse(seats):
     for s in seats:
         s["state"] = classify(s)
         decks.setdefault(s["deck"], []).append(s)
-    if DEBUG:
-        print("    seat table (deck, x, y, text, border colour, state):")
-        for s in sorted(seats, key=lambda s: (s["deck"], round(s["x"]), round(s["y"]))):
-            print(
-                f"      {s['deck']:<11} x={s['x']:.0f} y={s['y']:.0f} "
-                f"{s['text']:<8} colour={s['color']} -> {s['state']}"
-            )
     total, found = 0, False
     for deck, ds in sorted(decks.items()):
         sx = single_column(ds)
         if sx is None:
-            print(f"    {deck}: {len(ds)} seats, no 2+1 layout detected, so no single side")
+            print(f"    {deck}: {len(ds)} seats, no 2+1 layout detected")
             continue
         found = True
         singles = [s for s in ds if abs(s["x"] - sx) < COL_TOL]
-        sc = Counter(s["state"] for s in singles)
-        avail = sum(sc[k] for k in available_states())
+        counts = Counter(s["state"] for s in singles)
+        avail = sum(counts[k] for k in available_states())
         total += avail
-        print(
-            f"    {deck}: {len(singles)} single berths, available={avail} "
-            f"(states: {dict(sc)}); all seats on deck: {dict(Counter(s['state'] for s in ds))}"
-        )
+        print(f"    {deck}: {len(singles)} single berths, {avail} available {dict(counts)}")
     return total if found else None
 
 
-def read_singles(browser, url, date, target):
+def read_singles(browser, date, target):
+    """Open one bus's seat map and count its available single seats (None on failure)."""
     try:
-        ctx, page = open_results(browser, url, date)
+        ctx, page = open_results(browser, date)
     except Exception as e:
         print(f"    could not reopen results: {str(e).splitlines()[0]}")
         return None
     try:
-        cards = page.evaluate(TAG_CARDS_JS)
-        match = None
-        for c in cards:
-            ev = evaluate_card(c["text"])
-            if ev["ok"] and ev["dep"] == target["dep"] and ev["type"] == target["type"]:
-                match = c
-                break
-        if match is None:
+        card = next(
+            (
+                c for c in page.evaluate(TAG_CARDS_JS)
+                if (ev := evaluate_card(c["text"]))["ok"]
+                and ev["dep"] == target["dep"] and ev["type"] == target["type"]
+            ),
+            None,
+        )
+        if card is None:
             print("    bus no longer listed on reload")
             return None
-        btn = page.locator(f'[data-sc-btn="{match["i"]}"]').first
+        btn = page.locator(f'[data-sc-btn="{card["i"]}"]').first
         btn.scroll_into_view_if_needed(timeout=10000)
         btn.click(timeout=10000)
         try:
@@ -406,17 +357,13 @@ def read_singles(browser, url, date, target):
         page.wait_for_timeout(1500)
         seats = page.evaluate(SEATS_JS)
         print(f"    read {len(seats)} seats")
-        dump(page, f"seats-{date}-{target['dep']}")
-        if not seats:
-            dump(page, f"noseats-{date}-{target['dep']}", force=True)
-            return None
-        result = analyse(seats)
+        result = analyse(seats) if seats else None
         if result is None:
-            dump(page, f"nolayout-{date}-{target['dep']}", force=True)
+            dump(page, f"seats-fail-{date}-{target['dep']}")
         return result
     except Exception as e:
         print(f"    error reading seats: {e}")
-        dump(page, f"error-{date}-{target['dep']}", force=True)
+        dump(page, f"seats-error-{date}-{target['dep']}")
         return None
     finally:
         ctx.close()
@@ -438,22 +385,18 @@ def main():
     failures = 0
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
+            headless=False,
             channel="chrome",
             args=["--disable-blink-features=AutomationControlled", "--disable-http2"],
         )
         for date in dates:
-            url = SEARCH_URL.format(date=date)
             try:
-                ctx, page = open_results(browser, url, date)
+                ctx, page = open_results(browser, date)
             except Exception as e:
                 print(f"[{date}] could not load results: {str(e).splitlines()[0]}")
                 failures += 1
                 continue
             cards = page.evaluate(TAG_CARDS_JS)
-            if DEBUG:
-                report_listing(page, len(cards))
-            dump(page, f"results-{date}")
             ctx.close()
             print(f"[{date}] {len(cards)} buses listed")
 
@@ -463,8 +406,6 @@ def main():
                 if OPERATOR in c["text"].lower():
                     verdict = "WATCH" if ev["ok"] else f"skip ({ev['why']})"
                     print(f"  {verdict}: dep={ev['dep']} type={ev['type']!r}")
-                    if DEBUG:
-                        print(f"      card text: {c['text'].replace(chr(10), ' | ')[:350]!r}")
                 if ev["ok"] and not any(
                     t["dep"] == ev["dep"] and t["type"] == ev["type"] for t in targets
                 ):
@@ -475,7 +416,7 @@ def main():
             for target in targets:
                 key = f"{date}|{target['dep']}|{target['type']}"
                 print(f"  checking {key}")
-                singles = read_singles(browser, url, date, target)
+                singles = read_singles(browser, date, target)
                 time.sleep(3)
                 if singles is None:
                     print("    could not determine single seats; no alert decision made")
@@ -483,16 +424,13 @@ def main():
                     continue
                 alerted = state.get(key, {}).get("alerted", False)
                 eligible = MIN_SINGLES_TO_ALERT <= singles < ALERT_IF_SINGLES_BELOW
-                print(
-                    f"    available single seats: {singles} "
-                    f"(alert when {MIN_SINGLES_TO_ALERT} to {ALERT_IF_SINGLES_BELOW - 1})"
-                )
+                print(f"    available single seats: {singles}")
                 if eligible and not alerted:
                     if notify(
                         "Single seats running low",
                         f"{date} {target['dep']} {target['type']}: "
                         f"{singles} single seat{'s' if singles != 1 else ''} left.",
-                        click=url,
+                        click=URL_FORMS[0].format(date=date),
                     ):
                         alerted = True
                 elif singles >= ALERT_IF_SINGLES_BELOW:
@@ -515,7 +453,7 @@ def main():
             priority="default",
         )
     state["_meta"] = {"fail_streak": streak}
-    save_state(state)
+    STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True))
     if run_failed:
         sys.exit(1)
 

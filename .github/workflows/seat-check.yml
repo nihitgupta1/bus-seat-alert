@@ -1,17 +1,25 @@
 name: Check bus seats
 
+# GitHub's scheduler is slow and unreliable right now (runs arrive hours apart), so the
+# job below keeps itself busy for ~5h40m, checking about every 30 minutes, and then starts
+# the next run itself. The cron line is only a backup restart if that chain ever breaks.
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (UTC clock, same cadence anywhere)
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       test_notify:
         description: "Only send a test notification to my phone"
         type: boolean
         default: false
+      loop:
+        description: "Keep checking every ~30 min for hours (leave off for a single check)"
+        type: boolean
+        default: false
 
 permissions:
-  contents: write   # lets the job commit state.json so alerts aren't repeated
+  contents: write   # commit state.json so alerts aren't repeated
+  actions: write    # let a finished run start the next one
 
 concurrency:
   group: seat-check
@@ -20,7 +28,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
@@ -38,8 +46,23 @@ jobs:
       - name: Check seats
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          DEBUG: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-        run: python check_seats.py ${{ inputs.test_notify && '--test-notify' || '' }}
+          TEST_NOTIFY: ${{ inputs.test_notify }}
+          LOOP: ${{ github.event_name == 'schedule' || inputs.loop }}
+        run: |
+          if [ "$TEST_NOTIFY" = "true" ]; then
+            python check_seats.py --test-notify
+            exit 0
+          fi
+          if [ "$LOOP" != "true" ]; then
+            python check_seats.py
+            exit 0
+          fi
+          end=$((SECONDS + 20400))   # stop starting new checks after 340 minutes
+          while true; do
+            python check_seats.py || true
+            [ $((SECONDS + 1500)) -ge $end ] && break
+            sleep 1500               # plus ~2-4 min per check = roughly every 30 min
+          done
 
       - name: Save state
         if: always()
@@ -51,6 +74,12 @@ jobs:
             git commit -m "Update seat state"
             git push
           fi
+
+      - name: Start the next run
+        if: success() && (github.event_name == 'schedule' || inputs.loop)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run seat-check.yml -f loop=true
 
       - name: Upload debug files
         if: always()
