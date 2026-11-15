@@ -26,6 +26,7 @@ ALERT_IF_SINGLES_BELOW = 3      # alert when available singles is LESS than this
 MIN_SINGLES_TO_ALERT = 1        # no alert at 0 singles (nothing to book); set 0 to hear about sell-outs
 TRAVELLER = "male"              # "male", "female" or "any": which gender-restricted seats count
 FAIL_ALERT_AFTER = 4            # warn on phone after this many failed runs in a row (~2 hours)
+WARM_UP = True                 # visit redbus.in first, like a person, before opening the search
 
 SEARCH_URL = (
     "https://www.redbus.in/bus-tickets/indore-to-pune"
@@ -238,7 +239,15 @@ def open_results(browser, date):
         )
         page = ctx.new_page()
         try:
-            page.goto(SEARCH_URL.format(date=date), wait_until="domcontentloaded", timeout=40000)
+            if WARM_UP:  # start on the home page so the search arrives with cookies and a referrer
+                page.goto("https://www.redbus.in/", wait_until="domcontentloaded", timeout=40000)
+                page.wait_for_timeout(3000)
+            page.goto(
+                SEARCH_URL.format(date=date),
+                wait_until="domcontentloaded",
+                timeout=40000,
+                referer="https://www.redbus.in/" if WARM_UP else None,
+            )
             page.wait_for_function(f"({COUNT_JS})() > 0", timeout=50000)
             shown = re.search(r"onward=([^&]+)", page.url)
             if shown and shown.group(1).lower() != date.lower():
