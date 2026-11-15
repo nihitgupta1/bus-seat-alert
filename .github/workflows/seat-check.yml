@@ -1,11 +1,9 @@
 name: Check bus seats
 
-# GitHub's scheduler is slow and unreliable right now (runs arrive hours apart), so the
-# job below keeps itself busy for ~5h40m, checking about every 30 minutes, and then starts
-# the next run itself. The cron line is only a backup restart if that chain ever breaks.
+# Scheduled runs perform one check each hour. Manual runs can optionally loop.
 on:
   schedule:
-    - cron: "17,47 * * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       test_notify:
@@ -19,7 +17,6 @@ on:
 
 permissions:
   contents: write   # commit state.json so alerts aren't repeated
-  actions: write    # let a finished run start the next one
 
 concurrency:
   group: seat-check
@@ -47,7 +44,7 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TEST_NOTIFY: ${{ inputs.test_notify }}
-          LOOP: ${{ github.event_name == 'schedule' || inputs.loop }}
+          LOOP: ${{ github.event_name == 'workflow_dispatch' && inputs.loop }}
         run: |
           if [ "$TEST_NOTIFY" = "true" ]; then
             python check_seats.py --test-notify
@@ -74,12 +71,6 @@ jobs:
             git commit -m "Update seat state"
             git push
           fi
-
-      - name: Start the next run
-        if: success() && (github.event_name == 'schedule' || inputs.loop)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run seat-check.yml -f loop=true
 
       - name: Upload debug files
         if: always()
