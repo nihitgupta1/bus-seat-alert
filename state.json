@@ -35,21 +35,21 @@
     "singles": 0
   },
   "18-Nov-2026|18:15|Bharat Benz A/C Sleeper (2+1)": {
-    "alerted": false,
-    "checked": "2026-11-15T18:38+05:30",
-    "singles": 4
+    "alerted": true,
+    "checked": "2026-11-18T09:28+05:30",
+    "singles": 1
   },
   "18-Nov-2026|18:45|Volvo 9600 Multi-Axle A/C Sleeper (2+1)": {
     "alerted": true,
-    "checked": "2026-11-15T18:39+05:30",
-    "singles": 2
+    "checked": "2026-11-18T09:28+05:30",
+    "singles": 0
   },
   "18-Nov-2026|19:15|Volvo 9600 SLX Multi-Axle AC Sleeper (2+1)": {
     "alerted": true,
-    "checked": "2026-11-15T18:38+05:30",
-    "singles": 2
+    "checked": "2026-11-18T09:27+05:30",
+    "singles": 0
   },
   "_meta": {
-    "fail_streak": 1
+    "fail_streak": 0
   }
 }
